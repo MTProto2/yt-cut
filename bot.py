@@ -1,19 +1,28 @@
 """
 YouTube Clip Retranslator — Telegram bot + aiohttp clip server.
 
+The actual YouTube access/HLS-repackaging work is done by a vendored
+`yt-hls` (https://github.com/mixartemev/yt-hls) Node sidecar, spawned as a
+subprocess on startup and reached over loopback HTTP. This file owns the
+Telegram bot, the Mini App API, and a thin reverse proxy in front of the
+sidecar that keeps the public URL scheme stable.
+
 Env vars:
     BOT_TOKEN    — Telegram bot token from @BotFather
     SERVICE_URL  — public base URL for clip links (e.g. https://example.com)
     PORT         — HTTP server port (default 8080)
+    PRX          — HTTPS proxy passed to the yt-hls sidecar (bot-wall bypass)
+    TGPRX        — proxy for the Telegram Bot API session
+    YT_HLS_PORT  — loopback port for the yt-hls sidecar (default 8730)
 """
 
 import os
 import re
+import sys
 import asyncio
 import logging
 import time
 import tempfile
-import shutil
 import hmac
 import hashlib
 import json
@@ -32,7 +41,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
@@ -55,16 +64,10 @@ SERVICE_URL = os.environ.get("SERVICE_URL", "http://127.0.0.1:8080")
 PORT = int(os.environ.get("PORT", "8080"))
 PRX = os.environ.get("PRX")
 TGPRX = os.environ.get("TGPRX")
-YT_CLIENT = os.environ.get("YT_CLIENT")
-YT_COOKIES = os.environ.get("YT_COOKIES")
 
-_YT_COMMON = []
-if PRX:
-    _YT_COMMON += ["--proxy", PRX]
-if YT_CLIENT:
-    _YT_COMMON += ["--extractor-args", f"youtube:player_client={YT_CLIENT}"]
-if YT_COOKIES:
-    _YT_COMMON += ["--cookies", YT_COOKIES]
+YT_HLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt-hls")
+YT_HLS_PORT = int(os.environ.get("YT_HLS_PORT", "8730"))
+YT_HLS_BASE = f"http://127.0.0.1:{YT_HLS_PORT}"
 
 session = TGPRX and AiohttpSession(proxy=TGPRX)
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -73,21 +76,16 @@ dp = Dispatcher()
 VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})")
 
 _CACHE_TTL = 1800
-_BATCH = 30          # segments per ffmpeg job (30 × 4 s = 2 min)
 
-_url_cache: dict[tuple[str, str], tuple[str, float]] = {}
-# (vid, clip_start, clip_end, kind) → {batch_start_seg: (tmpdir, task|None, created_at)}
-_hls_batches: dict[tuple, dict[int, tuple[str, "asyncio.Task | None", float]]] = {}
 _title_cache: dict[tuple, str] = {}
 _meta_cache: dict[str, tuple[dict, float]] = {}
 
-_FORMATS = {
-    "video": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
-    "audio": "bestaudio[ext=m4a]/bestaudio",
-}
 _KIND_PREFIX = {"video": "", "audio": "/audio"}
 
 MINIAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp", "dist")
+
+http_client: ClientSession | None = None
+yt_hls_proc: "asyncio.subprocess.Process | None" = None
 
 
 def _clip_path(v: str, start: int, end: int, kind: str) -> str:
@@ -99,137 +97,97 @@ def _ts_path(v: str, start: int, end: int, kind: str) -> str:
     return "/ts" + _clip_path(v, start, end, kind)
 
 
+# ── yt-hls sidecar ───────────────────────────────────────────────────────────
+
+
+async def _start_yt_hls():
+    """Spawn the vendored yt-hls Node server and wait until it answers /healthz."""
+    global yt_hls_proc
+    env = os.environ.copy()
+    env["HOST"] = "127.0.0.1"
+    env["PORT"] = str(YT_HLS_PORT)
+    env["YT_HLS_PYTHON"] = sys.executable
+    env["YT_HLS_SESSIONS"] = os.path.join(tempfile.gettempdir(), "yt-hls-sessions")
+    if PRX:
+        env["HTTPS_PROXY"] = PRX
+
+    yt_hls_proc = await asyncio.create_subprocess_exec("node", "server.mjs", cwd=YT_HLS_DIR, env=env)
+    log.info("yt-hls sidecar starting (pid=%s)", yt_hls_proc.pid)
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if yt_hls_proc.returncode is not None:
+            raise RuntimeError(f"yt-hls sidecar exited early (code {yt_hls_proc.returncode})")
+        try:
+            async with http_client.get(f"{YT_HLS_BASE}/healthz", timeout=ClientTimeout(total=2)) as r:
+                if r.status == 200:
+                    log.info("yt-hls sidecar ready")
+                    return
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    raise RuntimeError("yt-hls sidecar did not become ready in time")
+
+
+async def _stop_yt_hls():
+    if not yt_hls_proc or yt_hls_proc.returncode is not None:
+        return
+    yt_hls_proc.terminate()
+    try:
+        await asyncio.wait_for(yt_hls_proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        yt_hls_proc.kill()
+        await yt_hls_proc.wait()
+
+
+def _sidecar_query(start: int, end: int, kind: str) -> dict:
+    q = {}
+    if start or end:
+        q["from"] = str(start)
+        if end:
+            q["to"] = str(end)
+    if kind == "audio":
+        q["x"] = "1"
+    return q
+
+
+async def _fetch_playlist(video_id: str, start: int, end: int, kind: str) -> str:
+    q = _sidecar_query(start, end, kind)
+    async with http_client.get(
+        f"{YT_HLS_BASE}/hls/{video_id}/index.m3u8", params=q, timeout=ClientTimeout(total=900),
+    ) as r:
+        text = await r.text()
+        if r.status != 200:
+            raise RuntimeError(text.strip() or f"sidecar status {r.status}")
+        return text
+
+
 # ── Clip server ──────────────────────────────────────────────────────────────
 
 
-async def _resolve(video_id: str, kind: str = "video") -> str:
+async def _fetch_meta(video_id: str) -> dict:
     now = time.time()
-    key = (video_id, kind)
-    cached = _url_cache.get(key)
+    cached = _meta_cache.get(video_id)
     if cached and now - cached[1] < _CACHE_TTL:
-        log.debug("resolve cache hit: %s/%s", video_id, kind)
         return cached[0]
 
-    log.info("resolve start: %s/%s", video_id, kind)
-    t0 = time.time()
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-f", _FORMATS[kind], "-g", *_YT_COMMON,
-        f"https://www.youtube.com/watch?v={video_id}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    if proc.returncode != 0:
-        err = stderr.decode().strip()
-        log.error("resolve failed (%.1fs): %s/%s — %s", time.time() - t0, video_id, kind, err)
-        raise RuntimeError(err)
+    async with http_client.get(
+        f"{YT_HLS_BASE}/play/{video_id}",
+        headers={"Accept": "application/json"},
+        timeout=ClientTimeout(total=120),
+    ) as r:
+        if r.status != 200:
+            raise RuntimeError((await r.text()).strip())
+        data = await r.json()
 
-    url = stdout.decode().strip().splitlines()[0]
-    log.info("resolve done (%.1fs): %s/%s", time.time() - t0, video_id, kind)
-    _url_cache[key] = (url, now)
-    return url
-
-
-def _cleanup_hls():
-    now = time.time()
-    for clip_key, batches in list(_hls_batches.items()):
-        for bs in [b for b, (_, _, ts) in batches.items() if now - ts > _CACHE_TTL]:
-            tmpdir, task, _ = batches.pop(bs)
-            if task and not task.done():
-                task.cancel()
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        if not batches:
-            del _hls_batches[clip_key]
-
-
-def _synth_m3u8(ts_base: str, duration: int) -> str:
-    """Full VOD playlist for a known-duration clip (no ffmpeg needed yet)."""
-    seg_time = 4
-    lines = [
-        "#EXTM3U", "#EXT-X-VERSION:3",
-        f"#EXT-X-TARGETDURATION:{seg_time}", "#EXT-X-MEDIA-SEQUENCE:0",
-    ]
-    t = i = 0
-    while t < duration:
-        d = min(seg_time, duration - t)
-        lines += [f"#EXTINF:{d:.6f},", f"{ts_base}?seg={i}"]
-        t += d; i += 1
-    lines.append("#EXT-X-ENDLIST")
-    return "\n".join(lines) + "\n"
-
-
-async def _ensure_batch(
-    video_id: str, clip_start: int, clip_end: int, kind: str, batch_start: int,
-) -> tuple[str, "asyncio.Task | None"]:
-    """
-    Ensure an ffmpeg job covering segments [batch_start, batch_start+_BATCH) is running.
-    Each job writes seg0.ts…segN.ts into its own tmpdir; local_seg = global_seg - batch_start.
-    """
-    clip_key = (video_id, clip_start, clip_end, kind)
-    _cleanup_hls()
-    batches = _hls_batches.setdefault(clip_key, {})
-
-    if batch_start in batches:
-        tmpdir, task, _ = batches[batch_start]
-        return tmpdir, task
-
-    stream_url = await _resolve(video_id, kind)
-
-    # Re-check after yield
-    if batch_start in batches:
-        tmpdir, task, _ = batches[batch_start]
-        return tmpdir, task
-
-    ffmpeg_ss = clip_start + batch_start * 4        # absolute seek position in video
-    batch_end_abs = clip_start + (batch_start + _BATCH) * 4
-    if clip_end:
-        ffmpeg_t = min(clip_end, batch_end_abs) - ffmpeg_ss
-        if ffmpeg_t <= 0:
-            raise RuntimeError(f"Segment {batch_start} is past clip end")
-    else:
-        ffmpeg_t = _BATCH * 4
-
-    tmpdir = tempfile.mkdtemp(prefix="hls_")
-    cmd = ["ffmpeg", "-ss", str(ffmpeg_ss), "-i", stream_url, "-t", str(ffmpeg_t)]
-    if kind == "audio":
-        cmd += ["-vn"]
-    cmd += [
-        "-c", "copy", "-f", "hls", "-hls_time", "4",
-        "-hls_playlist_type", "vod",
-        "-hls_segment_filename", os.path.join(tmpdir, "seg%d.ts"),
-        "-loglevel", "error",
-        os.path.join(tmpdir, "stream.m3u8"),
-    ]
-
-    log.info("ffmpeg batch start: %s/%s batch=%d (t=%d+%ds) tmpdir=%s",
-             video_id, kind, batch_start, ffmpeg_ss, ffmpeg_t, tmpdir)
-    t0 = time.time()
-    proc = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
-
-    async def _run():
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            batches.pop(batch_start, None)
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise RuntimeError("ffmpeg timeout")
-        if proc.returncode != 0:
-            err = stderr.decode().strip()
-            log.error("ffmpeg batch error (%.1fs): %s batch=%d rc=%d — %s",
-                      time.time() - t0, video_id, batch_start, proc.returncode, err)
-            batches.pop(batch_start, None)
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise RuntimeError(err or "ffmpeg error")
-        log.info("ffmpeg batch done (%.1fs): %s/%s batch=%d",
-                 time.time() - t0, video_id, kind, batch_start)
-        # mark as complete (task=None keeps the entry alive for TTL cleanup)
-        batches[batch_start] = (tmpdir, None, batches[batch_start][2])
-
-    task = asyncio.create_task(_run())
-    batches[batch_start] = (tmpdir, task, time.time())
-    return tmpdir, task
+    meta = {
+        "video_id": video_id,
+        "title": data.get("title") or video_id,
+        "duration": int((data.get("durationMs") or 0) / 1000),
+        "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+    }
+    _meta_cache[video_id] = (meta, now)
+    return meta
 
 
 async def handle_stream(request: web.Request) -> web.Response:
@@ -264,24 +222,13 @@ async def handle_stream(request: web.Request) -> web.Response:
 
     ts_base = SERVICE_URL + _ts_path(v, start, end, kind)
 
-    if end:
-        # Duration known → full VOD playlist immediately; batches start on first TS request.
-        m3u8 = _synth_m3u8(ts_base, end - start)
-        log.info("stream: synthetic m3u8 %d segs", (end - start + 3) // 4)
-    else:
-        # Duration unknown → must wait for ffmpeg to finish batch 0.
-        try:
-            tmpdir, task = await _ensure_batch(v, start, end, kind, 0)
-            if task is not None:
-                await task
-            tmpdir, _, _ = _hls_batches[(v, start, end, kind)][0]
-        except RuntimeError as e:
-            return web.json_response({"error": str(e)}, status=502)
-        with open(os.path.join(tmpdir, "stream.m3u8")) as f:
-            m3u8 = f.read()
-        m3u8 = re.sub(r"seg(\d+)\.ts", lambda m: f"{ts_base}?seg={m.group(1)}", m3u8)
-        log.info("stream: m3u8 from disk (end=0)")
+    try:
+        m3u8 = await _fetch_playlist(v, start, end, kind)
+    except Exception as e:
+        log.error("stream: sidecar failed for %s: %s", v, e)
+        return web.json_response({"error": str(e)}, status=502)
 
+    m3u8 = re.sub(r"seg(\d+)\.ts(?:\?[^\s]*)?", lambda m: f"{ts_base}?seg={int(m.group(1))}", m3u8)
     return web.Response(text=m3u8, content_type="application/vnd.apple.mpegurl")
 
 
@@ -294,78 +241,33 @@ async def handle_ts(request: web.Request) -> web.Response:
 
     if seg is None:
         return web.json_response({"error": "Required param: seg"}, status=400)
-
-    seg_n = int(seg)
-    batch_start = (seg_n // _BATCH) * _BATCH
-    local_seg = seg_n - batch_start
-
-    log.debug("ts request: seg=%d batch=%d local=%d", seg_n, batch_start, local_seg)
-    t0 = time.time()
-
     try:
-        tmpdir, task = await _ensure_batch(v, start, end, kind, batch_start)
-    except RuntimeError as e:
-        log.error("ts seg=%d: batch start failed: %s", seg_n, e)
-        return web.json_response({"error": str(e)}, status=502)
+        seg_n = int(seg)
+    except ValueError:
+        return web.json_response({"error": "Invalid seg"}, status=400)
 
-    ts_path = os.path.join(tmpdir, f"seg{local_seg}.ts")
-    next_path = os.path.join(tmpdir, f"seg{local_seg + 1}.ts")
-    m3u8_path = os.path.join(tmpdir, "stream.m3u8")
+    filename = f"seg{seg_n:05d}.ts"
+    q = _sidecar_query(start, end, kind)
+    t0 = time.time()
+    try:
+        async with http_client.get(
+            f"{YT_HLS_BASE}/hls/{v}/{filename}", params=q, timeout=ClientTimeout(total=900),
+        ) as r:
+            if r.status != 200:
+                body = (await r.text()).strip()
+                log.warning("ts seg=%d: sidecar %d — %s", seg_n, r.status, body)
+                status = 404 if r.status == 404 else 502
+                return web.json_response({"error": body or "Segment not found"}, status=status)
+            data = await r.read()
+    except asyncio.TimeoutError:
+        log.error("ts seg=%d: sidecar timeout", seg_n)
+        return web.json_response({"error": "sidecar timeout"}, status=504)
 
-    # With VOD mode, ffmpeg closes seg[N] before opening seg[N+1], so seg[N] is
-    # fully written when seg[N+1] exists or stream.m3u8 exists (ffmpeg finished).
-    for i in range(120):  # up to 60 s
-        if os.path.isfile(ts_path):
-            if os.path.isfile(next_path) or os.path.isfile(m3u8_path) or task is None or (task is not None and task.done()):
-                size = os.path.getsize(ts_path)
-                waited = time.time() - t0
-                if waited > 0.3:
-                    log.info("ts seg=%d ready after %.1fs size=%d", seg_n, waited, size)
-                else:
-                    log.debug("ts seg=%d size=%d", seg_n, size)
-                return web.FileResponse(ts_path, headers={"Content-Type": "video/mp2t"})
-        if task is not None and task.done():
-            if task.exception():
-                log.error("ts seg=%d: ffmpeg failed: %s", seg_n, task.exception())
-                return web.json_response({"error": str(task.exception())}, status=502)
-            if not os.path.isfile(ts_path):
-                log.warning("ts seg=%d: ffmpeg done, file missing", seg_n)
-                break
-        if i % 10 == 0:
-            log.debug("ts seg=%d: waiting... (%.1fs)", seg_n, time.time() - t0)
-        await asyncio.sleep(0.5)
-
-    log.error("ts seg=%d: not found after %.1fs", seg_n, time.time() - t0)
-    return web.json_response({"error": "Segment not found"}, status=404)
+    log.debug("ts seg=%d size=%d (%.1fs)", seg_n, len(data), time.time() - t0)
+    return web.Response(body=data, content_type="video/mp2t")
 
 
 # ── Mini App API ─────────────────────────────────────────────────────────────
-
-async def _fetch_meta(video_id: str) -> dict:
-    now = time.time()
-    cached = _meta_cache.get(video_id)
-    if cached and now - cached[1] < _CACHE_TTL:
-        return cached[0]
-
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--print", "%(title)s\n%(duration)s", *_YT_COMMON,
-        f"https://www.youtube.com/watch?v={video_id}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    if proc.returncode != 0:
-        raise RuntimeError(stderr.decode().strip())
-
-    title, duration = stdout.decode().strip().split("\n", 1)
-    meta = {
-        "video_id": video_id,
-        "title": title,
-        "duration": int(float(duration)),
-        "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-    }
-    _meta_cache[video_id] = (meta, now)
-    return meta
 
 
 def _verify_init_data(init_data: str) -> dict | None:
@@ -569,6 +471,9 @@ async def handle_root(request: web.Request) -> web.Response:
 
 
 async def main():
+    global http_client
+    http_client = ClientSession()
+
     app = web.Application()
     app.router.add_get("/", handle_root)
     vid = r"{v:[a-zA-Z0-9_-]{11}}"
@@ -595,6 +500,8 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
+    await _start_yt_hls()
+
     try:
         await bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(
@@ -609,6 +516,8 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await runner.cleanup()
+        await http_client.close()
+        await _stop_yt_hls()
 
 
 if __name__ == "__main__":
