@@ -4,3 +4,4 @@
 /miniapp/.env.local
 /miniapp/node_modules/
 /miniapp/dist/
+.DS_Store

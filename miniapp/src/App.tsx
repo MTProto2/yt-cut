@@ -16,7 +16,21 @@ const inTelegram = !!tg?.initData
 
 const YT_HLS_URL = (import.meta.env.VITE_YT_HLS_URL || 'http://localhost:8730').replace(/\/$/, '')
 
-const VIDEO_ID_RE = /(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/
+// youtu.be/<id>, youtube.com/watch?...v=<id>, /embed/<id>, /shorts/<id>, /live/<id>, /v/<id>
+const VIDEO_ID_RE =
+  /(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^#]*&)?v=|embed\/|shorts\/|live\/|v\/))([a-zA-Z0-9_-]{11})/
+const BARE_ID_RE = /^[a-zA-Z0-9_-]{11}$/
+
+// Accepts a full YouTube URL (any of the forms above, with or without ?si=… etc.) or a bare 11-char id.
+function extractVideoId(input: string): string | null {
+  const s = input.trim()
+  if (BARE_ID_RE.test(s)) return s
+  return VIDEO_ID_RE.exec(s)?.[1] ?? null
+}
+
+// Native Telegram haptics (no-op outside Telegram or on old clients).
+const haptic = (type: 'success' | 'warning' | 'error') =>
+  tg?.HapticFeedback?.notificationOccurred(type)
 
 interface Meta {
   video_id: string
@@ -32,7 +46,7 @@ const fmt = (s: number) => {
 }
 
 // Mirrors yt-hls's own from/to/x=1 query scheme (server.mjs: parseTrim/sessionQuery).
-function clipStreamUrl(videoId: string, start: number, end: number, audio: boolean): string {
+function clipQuery(start: number, end: number, audio: boolean): string {
   const p = new URLSearchParams()
   if (start || end) {
     p.set('from', String(start))
@@ -40,7 +54,17 @@ function clipStreamUrl(videoId: string, start: number, end: number, audio: boole
   }
   if (audio) p.set('x', '1')
   const qs = p.toString()
-  return `${YT_HLS_URL}/hls/${videoId}/index.m3u8${qs ? `?${qs}` : ''}`
+  return qs ? `?${qs}` : ''
+}
+
+// HLS stream (for playback/sharing).
+function clipStreamUrl(videoId: string, start: number, end: number, audio: boolean): string {
+  return `${YT_HLS_URL}/hls/${videoId}/index.m3u8${clipQuery(start, end, audio)}`
+}
+
+// Single-file download (yt-hls /dl: remux -c copy, Content-Disposition: attachment → .mp4 / .m4a for x=1).
+function clipDownloadUrl(videoId: string, start: number, end: number, audio: boolean): string {
+  return `${YT_HLS_URL}/dl/${videoId}${clipQuery(start, end, audio)}`
 }
 
 const PasteIcon = () => (
@@ -84,15 +108,16 @@ export default function App() {
     setLoading(true)
     setError(null)
     const timer = setTimeout(async () => {
-      const match = VIDEO_ID_RE.exec(trimmed)
-      if (!match) {
+      const videoId = extractVideoId(trimmed)
+      if (!videoId) {
         setMeta(null)
-        setError('Invalid YouTube URL')
+        setError('Неверная ссылка на YouTube')
         setLoading(false)
+        haptic('error')
         return
       }
       try {
-        const r = await fetch(`${YT_HLS_URL}/play/${match[1]}`, {
+        const r = await fetch(`${YT_HLS_URL}/play/${videoId}`, {
           headers: { Accept: 'application/json' },
         })
         if (!r.ok) {
@@ -100,6 +125,7 @@ export default function App() {
           const text = (await r.text()).replace(/^failed:\s*/, '').trim()
           setMeta(null)
           setError(text || 'Не удалось получить видео')
+          haptic('error')
         } else {
           const data = await r.json()
           const duration = Math.round((data.durationMs || 0) / 1000)
@@ -110,10 +136,12 @@ export default function App() {
             thumbnail: `https://img.youtube.com/vi/${data.id}/maxresdefault.jpg`,
           })
           setRange([0, duration])
+          haptic('success')
         }
       } catch {
         setMeta(null)
         setError('Сетевая ошибка')
+        haptic('error')
       } finally {
         setLoading(false)
       }
@@ -176,10 +204,28 @@ export default function App() {
     }
   }, [meta, range, audio, customTitle])
 
+  const onDownload = useCallback(() => {
+    if (!meta) return
+    const start = Math.round(range[0])
+    const end = Math.round(range[1])
+    const clipEnd = end >= meta.duration ? 0 : end
+    const url = clipDownloadUrl(meta.video_id, start, clipEnd, audio)
+    if (inTelegram && tg?.openLink) {
+      // In-app WebView can't save files — hand the attachment link to the external browser.
+      tg.openLink(url)
+    } else {
+      // Content-Disposition: attachment makes this a download, not a navigation.
+      const a = document.createElement('a')
+      a.href = url
+      a.download = ''
+      a.click()
+    }
+  }, [meta, range, audio])
+
   // MainButton wiring (Telegram only)
   useEffect(() => {
     if (!inTelegram || !tg?.MainButton) return
-    tg.MainButton.setText('Поделиться')
+    tg.MainButton.setText('📤 Поделиться')
     if (meta) {
       tg.MainButton.show()
       tg.MainButton.onClick(onShare)
@@ -188,6 +234,20 @@ export default function App() {
       tg.MainButton.hide()
     }
   }, [meta, onShare])
+
+  // SecondaryButton wiring (Telegram only, Bot API 7.10+)
+  useEffect(() => {
+    const btn = tg?.SecondaryButton
+    if (!inTelegram || !btn) return
+    btn.setText('📥 Скачать')
+    if (meta) {
+      btn.show()
+      btn.onClick(onDownload)
+      return () => btn.offClick(onDownload)
+    } else {
+      btn.hide()
+    }
+  }, [meta, onDownload])
 
   const onBrowserShare = useCallback(async () => {
     if (!meta) return
@@ -308,23 +368,42 @@ export default function App() {
             zIndex: 10,
           }}
         >
-          <button
-            type="button"
-            onClick={onBrowserShare}
-            style={{
-              width: '100%',
-              padding: '14px 16px',
-              border: 'none',
-              borderRadius: 12,
-              background: 'var(--tgui--button_color, #3390ec)',
-              color: 'var(--tgui--button_text_color, #ffffff)',
-              fontSize: 16,
-              fontWeight: 600,
-              cursor: 'pointer',
-            }}
-          >
-            Поделиться
-          </button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              type="button"
+              onClick={onDownload}
+              style={{
+                flex: 1,
+                padding: '14px 16px',
+                border: 'none',
+                borderRadius: 12,
+                background: 'var(--tgui--secondary_bg_color, #efeff4)',
+                color: 'var(--tgui--text_color, #000000)',
+                fontSize: 16,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              📥 Скачать
+            </button>
+            <button
+              type="button"
+              onClick={onBrowserShare}
+              style={{
+                flex: 1,
+                padding: '14px 16px',
+                border: 'none',
+                borderRadius: 12,
+                background: 'var(--tgui--button_color, #3390ec)',
+                color: 'var(--tgui--button_text_color, #ffffff)',
+                fontSize: 16,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              📤 Поделиться
+            </button>
+          </div>
         </div>
       )}
 
