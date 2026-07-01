@@ -3,7 +3,3 @@
 /.env
 *.egg-info
 /cookies.txt
-/yt-hls/node_modules/
-/yt-hls/sessions/
-/yt-hls/cache/
-/yt-hls/*.log

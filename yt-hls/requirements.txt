@@ -1,4 +1,0 @@
-# Python side: only pr_fetch.py, only one dependency.
-# curl_cffi gives real-browser TLS/HTTP2 fingerprints (chrome/firefox/safari)
-# so the playerResponse fetch can slip past YouTube's bot wall.
-curl_cffi>=0.7

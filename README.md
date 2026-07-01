@@ -11,11 +11,11 @@ YouTube Clip Retranslator — Telegram-бот + HLS-сервер для наре
 
 ## Запуск (Docker)
 
-Dockerfile двухстадийный: Node собирает Mini App, Python-стадия копирует `dist`, ставит `yt-hls/` (npm) и запускает его как сайдкар.
+Dockerfile двухстадийный: Node собирает Mini App, Python-стадия копирует `dist`.
 
 ```bash
 docker build -t yt-cut .
-docker run --env-file .env -p 8080:8080 -v ./bot.py:/app/bot.py yt-cut
+docker run --env-file .env -p 8080:8080 -v ./bot.py:/app/bot.py -v ./cookies.txt:/app/cookies.txt yt-cut
 ```
 
 ## Локальная разработка
@@ -45,6 +45,5 @@ PORT=8080
 ## Требования
 
 - Python 3.14, `aiogram >= 3.13` (нужен `save_prepared_inline_message`, Bot API 8.0+)
-- Системные: `node` (>= 20), `ffmpeg`/`ffprobe` в `PATH`
-- Бэкенд доступа к YouTube — вендоренный сайдкар `yt-hls/` (Node), см. `yt-hls/README.md`; `bot.py` запускает его сам как подпроцесс и ходит к нему по `127.0.0.1:8730`
+- Системные: `yt-dlp`, `ffmpeg` в `PATH`
 - Для сборки Mini App: Node 20 + npm (только локально; в Docker это делается автоматически)
