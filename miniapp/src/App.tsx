@@ -14,6 +14,10 @@ import {
 const tg = window.Telegram?.WebApp
 const inTelegram = !!tg?.initData
 
+const YT_HLS_URL = (import.meta.env.VITE_YT_HLS_URL || 'http://localhost:8730').replace(/\/$/, '')
+
+const VIDEO_ID_RE = /(?:youtu\.be\/|youtube\.com\/watch\?v=|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/
+
 interface Meta {
   video_id: string
   title: string
@@ -25,6 +29,18 @@ const fmt = (s: number) => {
   const m = Math.floor(s / 60)
   const sec = Math.floor(s % 60)
   return `${m}:${sec.toString().padStart(2, '0')}`
+}
+
+// Mirrors yt-hls's own from/to/x=1 query scheme (server.mjs: parseTrim/sessionQuery).
+function clipStreamUrl(videoId: string, start: number, end: number, audio: boolean): string {
+  const p = new URLSearchParams()
+  if (start || end) {
+    p.set('from', String(start))
+    if (end) p.set('to', String(end))
+  }
+  if (audio) p.set('x', '1')
+  const qs = p.toString()
+  return `${YT_HLS_URL}/hls/${videoId}/index.m3u8${qs ? `?${qs}` : ''}`
 }
 
 const PasteIcon = () => (
@@ -57,7 +73,7 @@ export default function App() {
     tg?.expand()
   }, [])
 
-  // Debounced metadata fetch on URL change
+  // Debounced metadata fetch on URL change — hits the yt-hls sidecar directly (CORS-open).
   useEffect(() => {
     const trimmed = url.trim()
     if (!trimmed) {
@@ -68,21 +84,34 @@ export default function App() {
     setLoading(true)
     setError(null)
     const timer = setTimeout(async () => {
+      const match = VIDEO_ID_RE.exec(trimmed)
+      if (!match) {
+        setMeta(null)
+        setError('Invalid YouTube URL')
+        setLoading(false)
+        return
+      }
       try {
-        const r = await fetch('/api/info', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: trimmed }),
+        const r = await fetch(`${YT_HLS_URL}/play/${match[1]}`, {
+          headers: { Accept: 'application/json' },
         })
-        const data = await r.json()
         if (!r.ok) {
+          // yt-hls returns plain text (not JSON) on error, even with Accept: application/json.
+          const text = (await r.text()).replace(/^failed:\s*/, '').trim()
           setMeta(null)
-          setError(data.error || 'Не удалось получить видео')
+          setError(text || 'Не удалось получить видео')
         } else {
-          setMeta(data)
-          setRange([0, data.duration])
+          const data = await r.json()
+          const duration = Math.round((data.durationMs || 0) / 1000)
+          setMeta({
+            video_id: data.id,
+            title: data.title || data.id,
+            duration,
+            thumbnail: `https://img.youtube.com/vi/${data.id}/maxresdefault.jpg`,
+          })
+          setRange([0, duration])
         }
-      } catch (e) {
+      } catch {
         setMeta(null)
         setError('Сетевая ошибка')
       } finally {
@@ -121,16 +150,17 @@ export default function App() {
     try {
       const start = Math.round(range[0])
       const end = Math.round(range[1])
+      const clipEnd = end >= meta.duration ? 0 : end
       const r = await fetch('/api/share', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           init_data: tg.initData,
-          video_id: meta.video_id,
-          start,
-          end: end >= meta.duration ? 0 : end,
           title: customTitle.trim() || meta.title,
-          kind: audio ? 'audio' : 'video',
+          original_title: meta.title,
+          clip_url: clipStreamUrl(meta.video_id, start, clipEnd, audio),
+          source_url: `https://www.youtube.com/watch?v=${meta.video_id}`,
+          thumbnail: meta.thumbnail,
         }),
       })
       const data = await r.json()
@@ -163,9 +193,8 @@ export default function App() {
     if (!meta) return
     const start = Math.round(range[0])
     const end = Math.round(range[1])
-    const endPart = end >= meta.duration ? '' : `/${end}`
-    const prefix = audio ? '/audio' : ''
-    const clipUrl = `${window.location.origin}${prefix}/${meta.video_id}/${start}${endPart}`
+    const clipEnd = end >= meta.duration ? 0 : end
+    const clipUrl = clipStreamUrl(meta.video_id, start, clipEnd, audio)
     const title = customTitle.trim() || meta.title
     try {
       if (navigator.share) {

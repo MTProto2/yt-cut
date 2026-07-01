@@ -1,18 +1,13 @@
-FROM node:20-alpine AS miniapp
+FROM node:20-alpine AS build
 WORKDIR /miniapp
 COPY miniapp/package.json miniapp/package-lock.json* ./
 RUN npm install
 COPY miniapp/ ./
+ARG VITE_YT_HLS_URL
+ENV VITE_YT_HLS_URL=${VITE_YT_HLS_URL}
 RUN npm run build
 
-FROM python:3.14-slim
-RUN apt update; apt install -y --no-install-recommends ffmpeg curl unzip ca-certificates; \
-    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh; rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY pyproject.toml .
-RUN pip install --no-cache-dir --pre .
-#COPY bot.py .
-COPY --from=miniapp /miniapp/dist ./miniapp/dist
-
-CMD ["python", "bot.py"]
+FROM nginx:alpine
+COPY --from=build /miniapp/dist /usr/share/nginx/html/miniapp
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 8080

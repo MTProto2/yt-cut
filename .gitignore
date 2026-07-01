@@ -1,5 +1,8 @@
 /.idea
-/.venv
 /.env
 *.egg-info
 /cookies.txt
+/miniapp/.env
+/miniapp/.env.local
+/miniapp/node_modules/
+/miniapp/dist/
